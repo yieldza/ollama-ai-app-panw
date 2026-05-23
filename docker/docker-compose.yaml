@@ -38,6 +38,15 @@ services:
     # (pinned via PANW_API_IMAGE in .env). Prevents `docker compose up` from
     # silently replacing the locally-fixed image with the upstream ghcr tag.
     pull_policy: never
+    healthcheck:
+      # Override the Dockerfile HEALTHCHECK which uses `localhost` — that
+      # resolves to ::1 first in Alpine, but the server binds 0.0.0.0
+      # (IPv4 only), so the probe gets ECONNREFUSED. Use 127.0.0.1 explicitly.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:11435/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     build:
       context: ..
       dockerfile: ./Dockerfile

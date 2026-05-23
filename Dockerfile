@@ -86,6 +86,6 @@ EXPOSE 11435
 # Lightweight liveness probe — does NOT call Ollama.
 # wget (BusyBox) is always available in Alpine.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget -qO- http://localhost:11435/healthz >/dev/null 2>&1 || exit 1
+    CMD wget -qO- http://127.0.0.1:11435/healthz >/dev/null 2>&1 || exit 1
 
 CMD ["./panw-api-ollama"]
