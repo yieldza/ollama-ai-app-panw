@@ -16,13 +16,15 @@ services:
     volumes:
       - ollama:/root/.ollama
     # Start ollama then pull the default model.
-    command: >
-      sh -c "ollama serve &
-             sleep 5 &&
-             ollama pull llama2-uncensored:latest &&
-             wait"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        sleep 5
+        ollama pull llama2-uncensored:latest
+        wait
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "/bin/ollama", "list"]
       interval: 30s
       timeout: 10s
       # start_period covers the initial model download; increase for large models.
@@ -34,7 +36,7 @@ services:
     image: ${PANW_API_IMAGE:-ghcr.io/paloaltonetworks/panw-api-ollama:latest}
     build:
       context: ..
-      dockerfile: ./docker/Dockerfile
+      dockerfile: ./Dockerfile
     container_name: panw-api-ollama
     depends_on:
       ollama:
@@ -56,13 +58,6 @@ services:
       - SECURITY_PROFILE_NAME
       - SECURITY_CONTEXTUAL_GROUNDING_CONTEXT
     restart: unless-stopped
-    healthcheck:
-      # /healthz is a lightweight probe that does NOT call Ollama.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:11435/healthz >/dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
 
   # ── OpenClaw agent ──────────────────────────────────────────────────────────
   openclaw:
@@ -71,7 +66,7 @@ services:
     user: "0:0"
     depends_on:
       panw-api-ollama:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "18789:18789"
     volumes:
@@ -84,6 +79,7 @@ services:
       - OLLAMA_BASE_URL=http://panw-api-ollama:11435
       - OPENCLAW_HOME=/home/node/.openclaw
       - OPENCLAW_GATEWAY_BIND=all
+      - OPENCLAW_GATEWAY_MODE=local
     restart: unless-stopped
 
   # ── Open WebUI ───────────────────────────────────────────────────────────────
@@ -93,7 +89,7 @@ services:
     container_name: open-webui
     depends_on:
       panw-api-ollama:
-        condition: service_healthy
+        condition: service_started
     ports:
       - ${OPEN_WEBUI_PORT:-3000}:8080
     volumes:
