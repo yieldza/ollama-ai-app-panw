@@ -1,0 +1,387 @@
+// Client for interacting with Ollama API services.
+//
+// This module provides a client for communicating with Ollama's API endpoints,
+// supporting both regular request/response patterns and streaming responses.
+//
+// # Overview
+//
+// The OllamaClient abstracts communication with Ollama API:
+// - Forwards requests to appropriate Ollama endpoints
+// - Handles both streaming and non-streaming responses
+// - Processes and transforms API errors into structured types
+// - Manages HTTP connection details
+use bytes::Bytes;
+use futures_util::Stream;
+use reqwest::{Client, Response, StatusCode};
+use serde::Serialize;
+use thiserror::Error;
+use tracing::{debug, error};
+
+/// Returns true if `header_name_lc` (lowercase) is a hop-by-hop header that
+/// must not be forwarded by a proxy (per RFC 7230 §6.1).
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+    )
+}
+
+/// Returns true if `header_name_lc` (lowercase) is a client-supplied
+/// credential header that must NOT be forwarded to upstream.
+///
+/// Forwarding the client's `Authorization`, `Cookie`, or `X-Api-Key` to a
+/// backend that doesn't expect them is a header-smuggling / credential-leak
+/// risk — see the comment in forward_raw for details.
+fn is_client_credential_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-csrf-token"
+    )
+}
+
+/// Builds the set of headers that will be forwarded to upstream Ollama.
+/// Drops hop-by-hop headers and any client-supplied credential headers.
+fn sanitize_forward_headers(headers: &reqwest::header::HeaderMap) -> reqwest::header::HeaderMap {
+    let mut forwarded = reqwest::header::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        let n = name.as_str().to_ascii_lowercase();
+        if is_hop_by_hop_header(&n) || is_client_credential_header(&n) {
+            continue;
+        }
+        forwarded.append(name.clone(), value.clone());
+    }
+    forwarded
+}
+
+// Errors that can occur when interacting with the Ollama API.
+//
+// This enum represents various failure modes when communicating with
+// Ollama services, including network issues and API-level errors.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum OllamaError {
+    // HTTP request errors (connection failures, timeouts, etc.)
+    #[error("HTTP request failed: {0}")]
+    RequestError(#[from] reqwest::Error),
+
+    // API-level errors returned by the Ollama service
+    #[error("Ollama API error: {status} - {message}")]
+    ApiError {
+        // HTTP status code returned by the API
+        status: StatusCode,
+        // Error message provided by the API
+        message: String,
+    },
+
+    // Configuration or initialization errors
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+}
+
+// Client for interacting with the Ollama API.
+//
+// This client provides methods for sending requests to Ollama endpoints
+// and handles the transformation of responses into appropriate formats.
+#[derive(Clone)]
+pub struct OllamaClient {
+    // HTTP client for making API requests
+    client: Client,
+
+    // Base URL for the Ollama API service
+    base_url: String,
+}
+
+impl OllamaClient {
+    //--------------------------------------------------------------------------
+    // Construction and Initialization
+    //--------------------------------------------------------------------------
+
+    // Creates a new Ollama API client.
+    //
+    // # Arguments
+    //
+    // * `base_url` - The base URL of the Ollama API service (e.g., "http://localhost:11434")
+    //
+    // # Example
+    //
+    // ```
+    // let client = OllamaClient::new("http://localhost:11434");
+    // ```
+    pub fn new(base_url: String) -> Result<Self, reqwest::Error> {
+        // Ollama generations can legitimately take many minutes; do NOT set an
+        // overall request timeout. Cap connect time and per-chunk read instead.
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .read_timeout(std::time::Duration::from_secs(120))
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .user_agent(concat!("panw-api-ollama/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Self { client, base_url })
+    }
+
+    //--------------------------------------------------------------------------
+    // Public API Methods
+    //--------------------------------------------------------------------------
+
+    // Forwards a POST request to the specified Ollama API endpoint.
+    //
+    // # Arguments
+    //
+    // * `endpoint` - The API endpoint to call (e.g., "/api/chat")
+    // * `body` - The request body to send, automatically serialized to JSON
+    //
+    // # Returns
+    //
+    // The raw HTTP response from the Ollama API if successful
+    //
+    // # Errors
+    //
+    // Returns an error if the request fails or the API returns an error status
+    pub async fn forward<T: Serialize + ?Sized>(
+        &self,
+        endpoint: &str,
+        body: &T,
+    ) -> Result<Response, OllamaError> {
+        self.forward_request(endpoint, |url| self.client.post(url).json(body))
+            .await
+    }
+
+    // Forwards a GET request to the specified Ollama API endpoint.
+    //
+    // # Arguments
+    //
+    // * `endpoint` - The API endpoint to call (e.g., "/api/tags")
+    //
+    // # Returns
+    //
+    // The raw HTTP response from the Ollama API if successful
+    //
+    // # Errors
+    //
+    // Returns an error if the request fails or the API returns an error status
+    pub async fn forward_get(&self, endpoint: &str) -> Result<Response, OllamaError> {
+        self.forward_request(endpoint, |url| self.client.get(url))
+            .await
+    }
+
+    // Sets up a streaming request to the specified Ollama API endpoint.
+    //
+    // This method is used for endpoints that support server-sent events or
+    // other streaming response formats.
+    //
+    // # Arguments
+    //
+    // * `endpoint` - The API endpoint to call (e.g., "/api/chat")
+    // * `body` - The request body to send, automatically serialized to JSON
+    //
+    // # Returns
+    //
+    // A stream of bytes from the API response
+    //
+    // # Errors
+    //
+    // Returns an error if the request fails or the API returns an error status
+    pub async fn stream<T: Serialize + ?Sized>(
+        &self,
+        endpoint: &str,
+        body: &T,
+    ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>>, OllamaError> {
+        let response = self
+            .forward_request(endpoint, |url| self.client.post(url).json(body))
+            .await?;
+        Ok(response.bytes_stream())
+    }
+
+    // Forwards an arbitrary request to upstream Ollama as a raw passthrough.
+    //
+    // Used by the catch-all fallback route to support every Ollama endpoint
+    // we do not explicitly implement (and any future additions). Preserves
+    // method, path, query, headers, and body bytes; does NOT scan, validate,
+    // or rewrite the body.
+    //
+    // Unlike `forward`/`forward_get`/`stream`, this method returns the
+    // upstream `Response` even when the status indicates failure, so the
+    // fallback can pass non-2xx responses through verbatim. Errors are only
+    // produced for true network failures (DNS, connect, timeout).
+    pub async fn forward_raw(
+        &self,
+        method: reqwest::Method,
+        path_and_query: &str,
+        headers: reqwest::header::HeaderMap,
+        body: Bytes,
+    ) -> Result<Response, OllamaError> {
+        let url = format!("{}{}", self.base_url, path_and_query);
+        debug!("Passthrough {} -> {}", method, url);
+        let mut req = self.client.request(method, &url);
+        req = req.headers(sanitize_forward_headers(&headers));
+        if !body.is_empty() {
+            req = req.body(body);
+        }
+        req.send().await.map_err(|e| {
+            error!("Passthrough request to Ollama failed: {}", e);
+            OllamaError::RequestError(e)
+        })
+    }
+
+    //--------------------------------------------------------------------------
+    // Helper Methods
+    //--------------------------------------------------------------------------
+
+    // Generic method to handle both GET and POST requests, reducing code duplication.
+    //
+    // # Arguments
+    //
+    // * `endpoint` - The API endpoint to call
+    // * `request_builder` - A function that configures the request
+    //
+    // # Returns
+    //
+    // The raw HTTP response if successful
+    //
+    // # Errors
+    //
+    // Returns an error if the request fails or the API returns an error status
+    async fn forward_request<F>(
+        &self,
+        endpoint: &str,
+        request_builder: F,
+    ) -> Result<Response, OllamaError>
+    where
+        F: FnOnce(&str) -> reqwest::RequestBuilder,
+    {
+        let url = format!("{}{}", self.base_url, endpoint);
+        debug!("Forwarding request to {}", url);
+
+        let response = request_builder(&url).send().await.map_err(|e| {
+            error!("Request to Ollama API failed: {}", e);
+            OllamaError::RequestError(e)
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!("Ollama API error: {} - {}", status, message);
+            return Err(OllamaError::ApiError { status, message });
+        }
+
+        debug!("Successfully received response from Ollama API");
+        Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    fn h(name: &str, value: &str) -> (HeaderName, HeaderValue) {
+        (
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        )
+    }
+
+    #[test]
+    fn hop_by_hop_headers_recognized() {
+        for n in [
+            "host",
+            "content-length",
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            "keep-alive",
+            "te",
+            "trailer",
+        ] {
+            assert!(is_hop_by_hop_header(n), "{} should be hop-by-hop", n);
+        }
+        assert!(!is_hop_by_hop_header("content-type"));
+        assert!(!is_hop_by_hop_header("user-agent"));
+    }
+
+    #[test]
+    fn credential_headers_recognized() {
+        for n in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "x-api-key",
+            "x-auth-token",
+            "x-csrf-token",
+        ] {
+            assert!(is_client_credential_header(n), "{} should be credential", n);
+        }
+        assert!(!is_client_credential_header("content-type"));
+        assert!(!is_client_credential_header("x-request-id"));
+    }
+
+    // REGRESSION: client Authorization / Cookie / X-Api-Key must never be
+    // forwarded to upstream Ollama. Previously these were relayed verbatim,
+    // creating a credential-leak vector.
+    #[test]
+    fn sanitize_strips_client_credentials() {
+        let mut src = HeaderMap::new();
+        let (n, v) = h("authorization", "Bearer secret-token");
+        src.insert(n, v);
+        let (n, v) = h("cookie", "session=abc");
+        src.insert(n, v);
+        let (n, v) = h("x-api-key", "k-12345");
+        src.insert(n, v);
+        let (n, v) = h("content-type", "application/json");
+        src.insert(n, v);
+        let (n, v) = h("user-agent", "test-client/1.0");
+        src.insert(n, v);
+
+        let out = sanitize_forward_headers(&src);
+        assert!(out.get("authorization").is_none(), "authorization must be stripped");
+        assert!(out.get("cookie").is_none(), "cookie must be stripped");
+        assert!(out.get("x-api-key").is_none(), "x-api-key must be stripped");
+        assert!(out.get("content-type").is_some(), "content-type must survive");
+        assert!(out.get("user-agent").is_some(), "user-agent must survive");
+    }
+
+    #[test]
+    fn sanitize_strips_hop_by_hop_headers() {
+        let mut src = HeaderMap::new();
+        let (n, v) = h("host", "example.com");
+        src.insert(n, v);
+        let (n, v) = h("connection", "keep-alive");
+        src.insert(n, v);
+        let (n, v) = h("content-type", "application/json");
+        src.insert(n, v);
+
+        let out = sanitize_forward_headers(&src);
+        assert!(out.get("host").is_none());
+        assert!(out.get("connection").is_none());
+        assert!(out.get("content-type").is_some());
+    }
+
+    #[test]
+    fn sanitize_is_case_insensitive_for_credentials() {
+        let mut src = HeaderMap::new();
+        // HeaderMap normalizes to lowercase internally, but ensure our match logic doesn't miss.
+        let (n, v) = h("Authorization", "Bearer x");
+        src.insert(n, v);
+        let out = sanitize_forward_headers(&src);
+        assert!(out.get("authorization").is_none());
+    }
+}

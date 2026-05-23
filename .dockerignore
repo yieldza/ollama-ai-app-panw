@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.vscode/
+docker/
+tests/
+*.md
+!README.md
+.gitignore
+.env
+.env.*
+config.yaml
+config.yaml.exemple

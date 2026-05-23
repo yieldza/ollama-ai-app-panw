@@ -1,0 +1,116 @@
+name: panw-api-ollama
+
+# Windows + NVIDIA GPU variant.
+# Before first run:
+#   copy .env.example .env       # then fill in SECURITY_API_KEY and SECURITY_PROFILE_NAME
+#   mkdir openclaw-workspace     # required for the openclaw bind-mount
+
+services:
+
+  # ── Ollama (NVIDIA GPU) ─────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:${OLLAMA_DOCKER_TAG:-latest}
+    container_name: ollama
+    pull_policy: always
+    tty: true
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    command: >
+      sh -c "ollama serve &
+             sleep 5 &&
+             ollama pull llama2-uncensored:latest &&
+             wait"
+    # NVIDIA GPU passthrough — requires nvidia-container-toolkit on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 5
+
+  # ── PANW security proxy ─────────────────────────────────────────────────────
+  panw-api-ollama:
+    image: ${PANW_API_IMAGE:-ghcr.io/paloaltonetworks/panw-api-ollama:latest}
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile
+    container_name: panw-api-ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=11435
+      - SERVER_DEBUG_LEVEL=${SERVER_DEBUG_LEVEL:-INFO}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - SECURITY_BASE_URL=${SECURITY_BASE_URL:-https://service.api.aisecurity.paloaltonetworks.com}
+      - SECURITY_APP_NAME=${SECURITY_APP_NAME:-panw-api-ollama}
+      - SECURITY_APP_USER=${SECURITY_APP_USER:-docker}
+      - RUST_LOG=${RUST_LOG:-info}
+      - SECURITY_API_KEY
+      - SECURITY_PROFILE_NAME
+      - SECURITY_CONTEXTUAL_GROUNDING_CONTEXT
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:11435/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ── OpenClaw agent ──────────────────────────────────────────────────────────
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw
+    user: "0:0"
+    depends_on:
+      panw-api-ollama:
+        condition: service_healthy
+    ports:
+      - "18789:18789"
+    volumes:
+      - openclaw-data:/home/node/.openclaw
+      - ./openclaw-workspace:/home/node/workspace
+    environment:
+      - NODE_ENV=production
+      - OLLAMA_BASE_URL=http://panw-api-ollama:11435
+      - OPENCLAW_HOME=/home/node/.openclaw
+      - OPENCLAW_GATEWAY_BIND=all
+    restart: unless-stopped
+
+  # ── Open WebUI ───────────────────────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG:-v0.9.5}
+    container_name: open-webui
+    depends_on:
+      panw-api-ollama:
+        condition: service_healthy
+    ports:
+      - ${OPEN_WEBUI_PORT:-3000}:8080
+    volumes:
+      - open-webui:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://panw-api-ollama:11435
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-}
+      - ENABLE_OPENAI_API=${ENABLE_OPENAI_API:-false}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+volumes:
+  ollama: {}
+  open-webui: {}
+  openclaw-data: {}

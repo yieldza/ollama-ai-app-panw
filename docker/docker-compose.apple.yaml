@@ -1,0 +1,95 @@
+# Apple Silicon (M1/M2/M3/M4) variant.
+# Ollama runs natively on macOS for full Neural Engine / GPU acceleration.
+# The proxy and UI run in arm64 containers.
+#
+# Prerequisites:
+#   1. Install Ollama: https://ollama.com/download
+#   2. ollama serve     (keep running in a terminal)
+#   3. ollama pull llama2-uncensored:latest
+#   4. cp .env.example .env  (fill in SECURITY_API_KEY and SECURITY_PROFILE_NAME)
+#   5. mkdir -p openclaw-workspace
+#   6. docker compose -f docker-compose.apple.yaml up -d
+
+name: panw-api-ollama
+
+services:
+
+  # ── PANW security proxy ─────────────────────────────────────────────────────
+  panw-api-ollama:
+    image: ${PANW_API_IMAGE:-ghcr.io/paloaltonetworks/panw-api-ollama:latest}
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile
+    container_name: panw-api-ollama
+    platform: linux/arm64
+    env_file:
+      - .env
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=11435
+      - SERVER_DEBUG_LEVEL=${SERVER_DEBUG_LEVEL:-INFO}
+      # Connects to the native Ollama on the Mac host.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - SECURITY_BASE_URL=${SECURITY_BASE_URL:-https://service.api.aisecurity.paloaltonetworks.com}
+      - SECURITY_APP_NAME=${SECURITY_APP_NAME:-panw-api-ollama}
+      - SECURITY_APP_USER=${SECURITY_APP_USER:-docker}
+      - RUST_LOG=${RUST_LOG:-info}
+      - SECURITY_API_KEY
+      - SECURITY_PROFILE_NAME
+      - SECURITY_CONTEXTUAL_GROUNDING_CONTEXT
+    restart: unless-stopped
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:11435/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ── OpenClaw agent ──────────────────────────────────────────────────────────
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw
+    platform: linux/arm64
+    user: "0:0"
+    depends_on:
+      panw-api-ollama:
+        condition: service_healthy
+    ports:
+      - "18789:18789"
+    volumes:
+      - openclaw-data:/home/node/.openclaw
+      - ./openclaw-workspace:/home/node/workspace
+    environment:
+      - NODE_ENV=production
+      - OLLAMA_BASE_URL=http://panw-api-ollama:11435
+      - OPENCLAW_HOME=/home/node/.openclaw
+      - OPENCLAW_GATEWAY_BIND=all
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  # ── Open WebUI ───────────────────────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG:-v0.9.5}
+    container_name: open-webui
+    platform: linux/arm64
+    depends_on:
+      panw-api-ollama:
+        condition: service_healthy
+    ports:
+      - ${OPEN_WEBUI_PORT:-3000}:8080
+    volumes:
+      - open-webui:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://panw-api-ollama:11435
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-}
+      - ENABLE_OPENAI_API=${ENABLE_OPENAI_API:-false}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+volumes:
+  open-webui: {}
+  openclaw-data: {}

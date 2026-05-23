@@ -1,0 +1,1250 @@
+use crate::{
+    handlers::utils::{format_security_violation_message, log_llm_metrics},
+    security::{Assessment, SecurityClient},
+    types::{StreamError, Content},
+};
+use bytes::Bytes;
+use futures_util::{ready, Future, Stream};
+use pin_project::pin_project;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::time::Sleep;
+
+/// Hard cap on combined buffered (text + code) bytes before forcing an assessment.
+/// Protects against OOM under sustained streaming without boundary triggers.
+const HARD_CAP_BYTES: usize = 400_000;
+/// Idle window after which an in-flight stream is force-assessed even without a
+/// boundary trigger. Defends against slow-dribble bypass attempts.
+const IDLE_FLUSH: Duration = Duration::from_millis(2000);
+
+// Type alias for complex assessment future to improve readability
+type AssessmentFuture = Pin<Box<dyn Future<Output = Result<Assessment, StreamError>> + Send>>;
+
+/// Snapshot of buffer state captured at the moment an assessment future was
+/// created. Used to ensure that, on a successful assessment, we only mark the
+/// portion of content that the assessment actually covered as "assessed" — and
+/// only release the pending chunks that fall within that snapshot. New chunks
+/// that arrived while the assessment was in flight remain unassessed and will
+/// trigger another assessment on the next poll.
+///
+/// Without this, a race releases unscanned bytes whenever new chunks arrive
+/// between the future's content-clone and its resolution.
+#[derive(Debug, Clone, Copy)]
+struct InflightSnapshot {
+    /// `text_buffer.len()` at clone time.
+    text_len: usize,
+    /// `code_buffer.len()` at clone time.
+    code_len: usize,
+    /// `pending_buffer.len()` (chunk count, not bytes) at clone time.
+    pending_count: usize,
+}
+
+/// Buffer for stream content that handles parsing, accumulation, and code extraction.
+///
+/// This struct maintains separate buffers for text and code content, tracks code block boundaries,
+/// and manages the buffering of content for security assessment.
+#[derive(Debug)]
+struct StreamBuffer {
+    text_buffer: String,
+    code_buffer: String,
+    in_code_block: bool,
+    read_pos: usize,
+    output_buffer: Vec<Bytes>,        // General output buffer
+    text_buffer_complete: Vec<Bytes>, // Buffer for complete text responses
+    code_buffer_complete: Vec<Bytes>, // Buffer for complete code blocks
+    pending_buffer: Vec<Bytes>,       // Buffer for content waiting for assessment
+    assessment_window: usize,
+    sentence_boundary_chars: &'static [char],
+    last_was_boundary: bool,
+    waiting_for_assessment: bool, // Flag indicating we're waiting for assessment
+    has_complete_text: bool,      // Flag indicating we have complete text
+    has_complete_code: bool,      // Flag indicating we have complete code
+    batch_ready: bool,            // Flag indicating a batch is ready to send
+    accumulating: bool,           // Flag indicating we're accumulating chunks
+    blocked: bool,                // Flag indicating content has been blocked
+    last_assessed_text_pos: usize, // Position in text buffer that has already been assessed
+    last_assessed_code_pos: usize, // Position in code buffer that has already been assessed
+    /// Set when an assessment future is in flight; cleared when its result is
+    /// processed. Captures the exact buffer state the future is scanning so
+    /// commit / release only act on the assessed portion.
+    inflight_snapshot: Option<InflightSnapshot>,
+}
+
+impl StreamBuffer {
+    /// Creates a new StreamBuffer with default settings.
+    ///
+    /// Initializes all buffers as empty and sets default values for assessment
+    /// parameters such as the assessment window size and sentence boundary characters.
+    fn new() -> Self {
+        // Constants for buffer sizing optimization
+        const ASSESSMENT_WINDOW: usize = 100_000;
+        const TEXT_INITIAL_CAPACITY: usize = ASSESSMENT_WINDOW / 10; // 10% of max assessment window
+        const VEC_INITIAL_CAPACITY: usize = 8; // Default small vector capacity
+        
+        Self {
+            text_buffer: String::with_capacity(TEXT_INITIAL_CAPACITY),
+            code_buffer: String::with_capacity(TEXT_INITIAL_CAPACITY),
+            in_code_block: false,
+            read_pos: 0,
+            output_buffer: Vec::with_capacity(VEC_INITIAL_CAPACITY),
+            text_buffer_complete: Vec::with_capacity(VEC_INITIAL_CAPACITY),
+            code_buffer_complete: Vec::with_capacity(VEC_INITIAL_CAPACITY),
+            pending_buffer: Vec::with_capacity(VEC_INITIAL_CAPACITY),
+            assessment_window: ASSESSMENT_WINDOW,
+            sentence_boundary_chars: &['\n'],
+            last_was_boundary: false,
+            waiting_for_assessment: false,
+            has_complete_text: false,
+            has_complete_code: false,
+            batch_ready: false,
+            accumulating: false,
+            blocked: false,
+            last_assessed_text_pos: 0,
+            last_assessed_code_pos: 0,
+            inflight_snapshot: None,
+        }
+    }
+
+    /// Record a snapshot of the current buffer state and return it. Must be
+    /// called immediately before creating an assessment future so the future
+    /// and the snapshot agree on what was scanned.
+    fn begin_assessment(&mut self) -> InflightSnapshot {
+        let snap = InflightSnapshot {
+            text_len: self.text_buffer.len(),
+            code_len: self.code_buffer.len(),
+            pending_count: self.pending_buffer.len(),
+        };
+        self.inflight_snapshot = Some(snap);
+        self.waiting_for_assessment = true;
+        snap
+    }
+
+    /// Processes a string chunk from the stream, parsing it as JSON and extracting content.
+    ///
+    /// This method parses Ollama's JSON response chunks, identifies and separates regular text
+    /// from code blocks, and maintains the state of code block detection between chunks.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk` - A string representing a JSON chunk from the Ollama API
+    fn process(&mut self, chunk: &str) {
+        // Parse Ollama's JSON response chunk. Both /api/chat (message.content) and
+        // /api/generate (top-level response) are supported.
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(chunk) {
+            let content_opt = json["message"]["content"]
+                .as_str()
+                .or_else(|| json["response"].as_str());
+            if let Some(content) = content_opt {
+                // Look for code block markers in the incoming content
+                if content.contains("```") {
+                    // Contains a code block marker, need special processing
+                    let parts: Vec<&str> = content.split("```").collect();
+                    let mut in_block = self.in_code_block;
+
+                    // Estimate total capacity needed to avoid multiple reallocations
+                    let additional_text_needed = parts
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i % 2 == (if in_block { 1 } else { 0 }))
+                        .map(|(_, part)| part.len())
+                        .sum::<usize>();
+
+                    let additional_code_needed = parts
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i % 2 == (if in_block { 0 } else { 1 }))
+                        .map(|(_, part)| part.len())
+                        .sum::<usize>();
+
+                    // Reserve capacity before adding strings
+                    self.text_buffer.reserve(additional_text_needed);
+                    self.code_buffer.reserve(additional_code_needed);
+
+                    for (i, part) in parts.iter().enumerate() {
+                        if i == 0 && !in_block {
+                            // First part before any code block
+                            if !part.is_empty() {
+                                self.text_buffer.push_str(part);
+                            }
+                        } else if i == 0 && in_block {
+                            // First part is continuation of a code block
+                            if !part.is_empty() {
+                                self.code_buffer.push_str(part);
+                            }
+                        } else if in_block {
+                            // This is code block content
+                            if !part.is_empty() {
+                                self.code_buffer.push_str(part);
+                            }
+                            in_block = false;
+                        } else {
+                            // This is regular text
+                            if !part.is_empty() {
+                                self.text_buffer.push_str(part);
+                            }
+                            in_block = true;
+                        }
+                    }
+
+                    // Update the code block state
+                    self.in_code_block = in_block;
+                } else {
+                    // No code block markers, add to the appropriate buffer
+                    // Reserve capacity before adding content
+                    if self.in_code_block {
+                        self.code_buffer.reserve(content.len());
+                        self.code_buffer.push_str(content);
+                    } else {
+                        self.text_buffer.reserve(content.len());
+                        self.text_buffer.push_str(content);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detects code block markers in the current active buffer.
+    ///
+    /// This method looks for triple backtick (```) markers in either the text or code buffer
+    /// (depending on the current state) and handles transitions between text and code content.
+    fn detect_code_blocks(&mut self) {
+        // Look for triple backticks in the current active buffer
+        let active_buffer = if self.in_code_block {
+            &self.code_buffer
+        } else {
+            &self.text_buffer
+        };
+
+        // Make a copy of the buffer to search to avoid borrow issues
+        let buffer_copy = active_buffer.clone();
+
+        // Find code block markers
+        if let Some(pos) = buffer_copy.find("```") {
+            if self.in_code_block {
+                // End of a code block
+                // Extract content before the marker and clear the buffer
+                let code_content = active_buffer[..pos].to_string();
+                if self.in_code_block {
+                    self.code_buffer.clear();
+                    self.code_buffer.push_str(&code_content);
+                }
+
+                // Add content after the marker to the text buffer
+                if pos + 3 < buffer_copy.len() {
+                    let remaining = &buffer_copy[pos + 3..];
+                    self.text_buffer.push_str(remaining);
+                }
+
+                // Mark that we have a complete code block
+                self.has_complete_code = true;
+            } else {
+                // Start of a code block
+                // Extract content before the marker
+                let text_content = active_buffer[..pos].to_string();
+                if !self.in_code_block {
+                    self.text_buffer.clear();
+                    self.text_buffer.push_str(&text_content);
+                }
+
+                // Add content after the marker to the code buffer
+                if pos + 3 < buffer_copy.len() {
+                    let remaining = &buffer_copy[pos + 3..];
+                    self.code_buffer.push_str(remaining);
+                }
+            }
+
+            // Toggle code block state
+            self.in_code_block = !self.in_code_block;
+        }
+    }
+
+    /// Prepares content for security assessment based on the current buffer state.
+    ///
+    /// Creates a Content structure containing either prompt or response data along with
+    /// any associated code blocks, depending on whether the content is a prompt or response.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_prompt` - Boolean indicating if the content is a prompt (true) or response (false)
+    ///
+    /// # Returns
+    ///
+    /// A Content structure with the appropriate fields populated
+    fn prepare_assessment_content(&mut self, is_prompt: bool) -> Content {
+        // Get only the new (unassessed) portions of the text and code buffers
+        let new_text = if self.text_buffer.len() > self.last_assessed_text_pos {
+            &self.text_buffer[self.last_assessed_text_pos..]
+        } else {
+            ""
+        };
+
+        let new_code = if self.code_buffer.len() > self.last_assessed_code_pos {
+            &self.code_buffer[self.last_assessed_code_pos..]
+        } else {
+            ""
+        };
+
+        let has_new_code = !new_code.is_empty();
+
+        if is_prompt {
+            Content {
+                prompt: Some(new_text.to_string()),
+                response: None,
+                code_prompt: if has_new_code { Some(new_code.to_string()) } else { None },
+                code_response: None,
+                context: None,
+                tool_event: None,
+            }
+        } else {
+            Content {
+                prompt: None,
+                response: Some(new_text.to_string()),
+                code_prompt: None,
+                code_response: if has_new_code { Some(new_code.to_string()) } else { None },
+                context: None,
+                tool_event: None,
+            }
+        }
+    }
+
+    /// Determines if the current buffer state contains content that should be assessed.
+    ///
+    /// Content is considered assessable if it exceeds the assessment window size,
+    /// contains a complete code block, or forms a complete sentence or paragraph.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_prompt` - Boolean indicating if the content is a prompt (true) or response (false)
+    ///
+    /// # Returns
+    ///
+    /// Some(Content) if there is assessable content, None otherwise
+    fn get_assessable_chunk(&mut self, is_prompt: bool) -> Option<Content> {
+        let new_text_content = self.text_buffer.len() > self.last_assessed_text_pos;
+        let new_code_content = self.code_buffer.len() > self.last_assessed_code_pos;
+
+        // Check if there is any new content to assess
+        if !new_text_content && !new_code_content {
+            return None;
+        }
+
+        // Safety check - make sure positions are valid to prevent subtraction overflow
+        if self.text_buffer.len() < self.last_assessed_text_pos {
+            self.last_assessed_text_pos = 0;
+        }
+        if self.code_buffer.len() < self.last_assessed_code_pos {
+            self.last_assessed_code_pos = 0;
+        }
+
+        // Always assess if we've accumulated a large amount of new content
+        if (self.text_buffer.len() - self.last_assessed_text_pos) >= self.assessment_window
+            || (self.code_buffer.len() - self.last_assessed_code_pos) >= self.assessment_window
+        {
+            return Some(self.prepare_assessment_content(is_prompt));
+        }
+
+        // If we've completed a code block, assess it
+        if !self.in_code_block && new_code_content {
+            return Some(self.prepare_assessment_content(is_prompt));
+        }
+
+        // Check for semantic boundaries in text
+        if new_text_content {
+            let last_char = self.text_buffer.chars().last().unwrap_or(' ');
+            if self.sentence_boundary_chars.contains(&last_char)
+                && self.text_buffer.len() > 15
+                && !self.last_was_boundary
+            {
+                self.last_was_boundary = true;
+                return Some(self.prepare_assessment_content(is_prompt));
+            } else if !self.sentence_boundary_chars.contains(&last_char) {
+                self.last_was_boundary = false;
+            }
+        }
+
+        None
+    }
+
+    /// Commits the current buffer state after a successful assessment.
+    ///
+    /// Advances `last_assessed_*` only up to the lengths captured in the
+    /// in-flight snapshot — NOT the current buffer lengths. This prevents a
+    /// race where chunks that arrived during assessment are marked as
+    /// "assessed" without ever being scanned.
+    ///
+    /// Code buffer: drains the assessed prefix (the portion the future saw)
+    /// but keeps any new bytes that arrived during assessment, so they will
+    /// be picked up by the next assessment.
+    fn commit(&mut self, is_safe: bool) {
+        if !is_safe {
+            return;
+        }
+        if let Some(snap) = self.inflight_snapshot {
+            // Text buffer is append-only; just advance the assessed pointer.
+            self.last_assessed_text_pos = snap.text_len.min(self.text_buffer.len());
+            // Code buffer drains its assessed prefix; the rest stays unassessed.
+            let drain_n = snap.code_len.min(self.code_buffer.len());
+            if drain_n > 0 {
+                self.code_buffer.drain(..drain_n);
+            }
+            self.last_assessed_code_pos = 0;
+            self.read_pos = self.last_assessed_text_pos;
+        } else {
+            // No snapshot recorded (e.g. legacy callers / empty-buffer path).
+            // Fall back to current lengths.
+            self.last_assessed_text_pos = self.text_buffer.len();
+            self.last_assessed_code_pos = self.code_buffer.len();
+            self.read_pos = self.text_buffer.len();
+            self.code_buffer.clear();
+        }
+    }
+
+    /// Adds a chunk to the pending buffer for later assessment.
+    ///
+    /// This method stores chunks that are waiting for security assessment before
+    /// being released to the output stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - The raw bytes to store in the pending buffer
+    fn buffer_pending_chunk(&mut self, bytes: Bytes) {
+        self.pending_buffer.push(bytes);
+        self.waiting_for_assessment = true;
+    }
+
+    /// Moves the assessed prefix of `pending_buffer` to the output buffers.
+    ///
+    /// Only the first `inflight_snapshot.pending_count` chunks are released —
+    /// chunks that arrived AFTER the assessment future was created remain in
+    /// `pending_buffer` and will be released by a subsequent assessment.
+    ///
+    /// Without this bound, pending bytes that the assessment never saw could
+    /// be flushed to the client downstream.
+    fn release_pending_chunks(&mut self) {
+        let take_count = self
+            .inflight_snapshot
+            .as_ref()
+            .map(|s| s.pending_count.min(self.pending_buffer.len()))
+            .unwrap_or_else(|| self.pending_buffer.len());
+
+        if take_count == 0 {
+            // Nothing to release (e.g. an empty-buffer assessment). Still flip
+            // waiting_for_assessment if no pending remains.
+            if self.pending_buffer.is_empty() {
+                self.waiting_for_assessment = false;
+            }
+            return;
+        }
+
+        let released: Vec<Bytes> = self.pending_buffer.drain(..take_count).collect();
+
+        let mut has_code = false;
+        for bytes in &released {
+            if let Ok(chunk) = std::str::from_utf8(bytes) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(chunk) {
+                    if let Some(content) = json["message"]["content"].as_str() {
+                        if content.contains("```") || self.in_code_block {
+                            has_code = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_code {
+            for chunk in released {
+                self.code_buffer_complete.push(chunk);
+            }
+            self.has_complete_code = true;
+        } else {
+            for chunk in released {
+                self.text_buffer_complete.push(chunk);
+            }
+            self.has_complete_text = true;
+        }
+
+        self.mark_batch_ready();
+        // Stay in waiting_for_assessment if more unassessed pending remains.
+        if self.pending_buffer.is_empty() {
+            self.waiting_for_assessment = false;
+        }
+    }
+
+    /// Marks the current batch of content as ready to be returned.
+    ///
+    /// This method is called when either text or code content has been completed
+    /// and is ready to be sent to the consumer.
+    fn mark_batch_ready(&mut self) {
+        // If we have completed code blocks or text, mark the batch as ready
+        if self.has_complete_code || self.has_complete_text {
+            self.batch_ready = true;
+            self.accumulating = false;
+        }
+    }
+
+    /// Creates a single response from all accumulated content in the relevant buffer.
+    ///
+    /// Combines chunks from either code, text, or general output buffers into a single
+    /// response, prioritizing code content if available.
+    ///
+    /// # Returns
+    ///
+    /// Some(Bytes) if there is content to return, None otherwise
+    fn create_complete_response(&mut self) -> Option<Bytes> {
+        // Pre-calculate the total buffer size needed to avoid reallocations
+        let total_size = if self.has_complete_code {
+            self.code_buffer_complete
+                .iter()
+                .map(|b| b.len())
+                .sum::<usize>()
+        } else if self.has_complete_text {
+            self.text_buffer_complete
+                .iter()
+                .map(|b| b.len())
+                .sum::<usize>()
+        } else {
+            self.output_buffer.iter().map(|b| b.len()).sum::<usize>()
+        };
+
+        // Pre-allocate with the right size
+        let mut combined_data = Vec::with_capacity(total_size);
+
+        // If we have complete code, prioritize that
+        if self.has_complete_code {
+            // Combine all code chunks
+            for chunk in self.code_buffer_complete.drain(..) {
+                combined_data.extend_from_slice(&chunk);
+            }
+            self.has_complete_code = false;
+        } else if self.has_complete_text {
+            // Combine all text chunks
+            for chunk in self.text_buffer_complete.drain(..) {
+                combined_data.extend_from_slice(&chunk);
+            }
+            self.has_complete_text = false;
+        } else {
+            // Combine all general output chunks
+            for chunk in self.output_buffer.drain(..) {
+                combined_data.extend_from_slice(&chunk);
+            }
+        }
+
+        self.batch_ready = false;
+
+        if !combined_data.is_empty() {
+            Some(Bytes::from(combined_data))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the next complete chunk if a batch is ready.
+    ///
+    /// This method only returns content when a complete batch is ready, as indicated
+    /// by the batch_ready flag.
+    ///
+    /// # Returns
+    ///
+    /// Some(Bytes) if a complete batch is ready, None otherwise
+    fn get_next_chunk(&mut self) -> Option<Bytes> {
+        if self.batch_ready {
+            return self.create_complete_response();
+        }
+
+        // Not returning individual chunks - accumulate until batch is ready
+        None
+    }
+
+    /// True when accumulated unassessed text+code exceeds the hard cap. Triggers a
+    /// forced assessment to bound memory growth.
+    fn over_cap(&self) -> bool {
+        self.text_buffer.len() > HARD_CAP_BYTES
+            || self.code_buffer.len() > HARD_CAP_BYTES
+            || self.text_buffer.len() + self.code_buffer.len() > HARD_CAP_BYTES
+    }
+
+    /// True when there is unassessed content waiting (text or code beyond the last
+    /// assessed positions).
+    fn has_unassessed_content(&self) -> bool {
+        self.text_buffer.len() > self.last_assessed_text_pos
+            || self.code_buffer.len() > self.last_assessed_code_pos
+    }
+}
+
+#[pin_project]
+/// A stream wrapper that performs security assessment on content chunks.
+///
+/// This stream wraps any stream of bytes and performs security assessment on the content
+/// before passing it on to consumers. It handles buffering, batching, and separating
+/// text and code content for assessment.
+pub struct SecurityAssessedStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    #[pin]
+    inner: S,
+    security_client: SecurityClient,
+    model_name: String,
+    buffer: StreamBuffer,
+    assessment_fut: Option<AssessmentFuture>,
+    finished: bool,
+    retry_count: u32,
+    is_prompt: bool,
+    /// Idle-flush timer. Fires when no inner-stream chunk has arrived for IDLE_FLUSH
+    /// and there is unassessed content; forces an assessment to defend against
+    /// slow-dribble bypass.
+    #[pin]
+    idle_timer: Sleep,
+}
+
+/// Creates a formatted response for blocked content.
+///
+/// This function generates a standardized message indicating that content has been
+/// blocked by the security assessment system, including the category, action details,
+/// and specific detection information.
+///
+/// # Arguments
+///
+/// * `assessment` - The complete security assessment result
+///
+/// # Returns
+///
+/// Bytes containing the formatted blocked content message
+fn create_blocked_response(assessment: &Assessment) -> Bytes {
+    // Format a JSON response that looks like a normal LLM response but contains our blocked message
+    let blocked_json = serde_json::json!({
+        "model": "security-filter", // Could be customized if needed
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "message": {
+            "role": "assistant",
+            "content": format_security_violation_message(assessment)
+        },
+        "done": true
+    });
+
+    // Convert to bytes
+    Bytes::from(serde_json::to_vec(&blocked_json).unwrap_or_else(|_| {
+        format!(
+            "BLOCKED - Category: {}, Action: {}",
+            assessment.category, assessment.action
+        )
+        .into_bytes()
+    }))
+}
+
+/// Creates a future that will perform security assessment on buffered content.
+///
+/// This function prepares the content from the buffer and creates an asynchronous task
+/// that will perform a security assessment using the provided security client.
+///
+/// # Arguments
+///
+/// * `buffer` - The StreamBuffer containing content to assess
+/// * `security_client` - The client to use for security assessment
+/// * `model_name` - The name of the AI model being used
+/// * `is_prompt` - Whether the content is a prompt (true) or response (false)
+///
+/// # Returns
+///
+/// A pinned, boxed future that will resolve to an Assessment result
+fn create_security_assessment_future(
+    buffer: &StreamBuffer,
+    security_client: &SecurityClient,
+    model_name: &str,
+    is_prompt: bool,
+) -> AssessmentFuture {
+    let client = security_client.clone();
+    let model = model_name.to_string();
+    // Decide which path to take BEFORE allocating the second buffer copy:
+    // when there is no code content the future does not need the empty
+    // `code_buffer` and the heap copy is pointless.
+    let has_code = !buffer.code_buffer.is_empty();
+    let text_content = buffer.text_buffer.clone();
+    let code_content = if has_code {
+        Some(buffer.code_buffer.clone())
+    } else {
+        None
+    };
+
+    Box::pin(async move {
+        match code_content {
+            Some(code) => client
+                .assess_content_with_code(&text_content, &code, &model, is_prompt)
+                .await
+                .map_err(|e| StreamError::SecurityError(e.to_string())),
+            None => client
+                .assess_content(&text_content, &model, is_prompt)
+                .await
+                .map_err(|e| StreamError::SecurityError(e.to_string())),
+        }
+    })
+}
+
+impl<S> SecurityAssessedStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    /// Creates a new SecurityAssessedStream wrapping an inner byte stream.
+    ///
+    /// This constructor initializes a new stream that will perform security assessment
+    /// on content chunks from the inner stream before passing them on.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The inner stream to wrap, which produces bytes
+    /// * `security_client` - Client for performing security assessments
+    /// * `model_name` - Name of the AI model being used
+    /// * `is_prompt` - Whether this stream contains prompt (true) or response (false) content
+    ///
+    /// # Returns
+    ///
+    /// A new SecurityAssessedStream instance
+    pub fn new(
+        inner: S,
+        security_client: SecurityClient,
+        model_name: String,
+        is_prompt: bool,
+    ) -> Self {
+        Self {
+            inner,
+            security_client,
+            model_name,
+            buffer: StreamBuffer::new(),
+            assessment_fut: None,
+            finished: false,
+            retry_count: 0,
+            is_prompt,
+            idle_timer: tokio::time::sleep(IDLE_FLUSH),
+        }
+    }
+
+    /// Processes the results of a security assessment on buffered content.
+    ///
+    /// This method handles what happens after a security assessment is completed,
+    /// either passing content through if it's safe or blocking it if it's unsafe.
+    ///
+    /// # Arguments
+    ///
+    /// * `assessment` - The security assessment result
+    /// * `buffer` - The buffer containing content that was assessed
+    /// * `assessment_fut` - The future that produced the assessment (will be cleared)
+    /// * `retry_count` - Counter for assessment retry attempts
+    ///
+    /// # Returns
+    ///
+    /// Some(Result) if a response should be sent immediately, None if processing should continue
+    fn process_assessment_result(
+        assessment: Assessment,
+        buffer: &mut StreamBuffer,
+        assessment_fut: &mut Option<AssessmentFuture>,
+        retry_count: &mut u32,
+    ) -> Option<Result<Bytes, StreamError>> {
+        // Important: Always clear the future after processing to avoid "resumed after completion" panic
+        *assessment_fut = None;
+
+        if !assessment.is_safe {
+            let blocked = create_blocked_response(&assessment);
+            *retry_count = 0;
+            // Clear the pending buffer since we're not going to send these chunks
+            buffer.pending_buffer.clear();
+            buffer.waiting_for_assessment = false;
+            buffer.accumulating = false;
+            buffer.blocked = true;
+            buffer.inflight_snapshot = None;
+            return Some(Ok(blocked));
+        }
+
+        // Don't try to send content if the buffer is empty
+        if buffer.text_buffer.is_empty()
+            && buffer.code_buffer.is_empty()
+            && buffer.pending_buffer.is_empty()
+        {
+            buffer.commit(true);
+            buffer.inflight_snapshot = None;
+            return None;
+        }
+
+        // If the assessment indicates masking, replace the pending buffer with the masked content
+        if assessment.is_masked {
+            // Clear existing pending chunks
+            buffer.pending_buffer.clear();
+
+            // Build a single masked JSON object and return it as the only chunk.
+            // Add a trailing newline to make NDJSON consumers happier.
+            let masked_json = serde_json::json!({
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "done": true,
+                "message": { "content": assessment.final_content, "role": "assistant" }
+            });
+
+            let mut vec = serde_json::to_vec(&masked_json).unwrap_or_else(|_| assessment.final_content.clone().into_bytes());
+            vec.push(b'\n');
+            let bytes = Bytes::from(vec);
+
+            // Mark the buffer as blocked/finished so no further inner stream data is processed
+            buffer.waiting_for_assessment = false;
+            buffer.accumulating = false;
+            buffer.blocked = true;
+            buffer.inflight_snapshot = None;
+
+            return Some(Ok(bytes));
+        }
+
+        // Safe path: release the assessed slice of pending chunks first
+        // (release reads inflight_snapshot.pending_count), then commit the
+        // assessed buffer positions, then clear the snapshot so the next
+        // assessment can record a fresh one.
+        buffer.release_pending_chunks();
+        buffer.commit(true);
+        buffer.inflight_snapshot = None;
+
+        // We don't return a result here - we'll let the chunks flow through via get_next_chunk
+        None
+    }
+
+    /// Processes a single chunk from the stream.
+    ///
+    /// This method handles incoming bytes, processing them for content extraction
+    /// and determining whether a security assessment is needed.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - The raw bytes from the stream
+    /// * `buffer` - The buffer to store processed content
+    /// * `assessment_fut` - Optional future for pending assessments
+    /// * `security_client` - Client for performing security assessments
+    /// * `model_name` - Name of the AI model being used
+    /// * `is_prompt` - Whether this is prompt or response content
+    ///
+    /// # Returns
+    ///
+    /// Some(Result) if a response should be sent immediately, None if processing should continue
+    fn process_stream_chunk(
+        bytes: Bytes,
+        buffer: &mut StreamBuffer,
+        assessment_fut: &mut Option<AssessmentFuture>,
+        security_client: &SecurityClient,
+        model_name: &str,
+        is_prompt: bool,
+    ) -> Option<Result<Bytes, StreamError>> {
+        if let Ok(chunk) = std::str::from_utf8(&bytes) {
+            // Final chunk metrics
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(chunk) {
+                if json.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    log_llm_metrics(&json, true);
+                }
+            }
+
+            buffer.process(chunk);
+            buffer.detect_code_blocks();
+            buffer.buffer_pending_chunk(bytes);
+        } else {
+            // Non-UTF8 bytes: still buffer them so a forced assessment can cover them.
+            buffer.buffer_pending_chunk(bytes);
+        }
+
+        // Trigger assessment ONLY when:
+        //   1. No assessment future is already in flight (avoid drop-on-overwrite race), AND
+        //   2. Either an assessable boundary/window was reached, OR the hard cap was hit.
+        //
+        // The previous unconditional fallback caused a per-chunk PANW round trip; removing it
+        // reduces calls by 5-50x without weakening correctness because tail content is
+        // re-checked at stream-end via process_stream_end.
+        if assessment_fut.is_none()
+            && (buffer.get_assessable_chunk(is_prompt).is_some() || buffer.over_cap())
+        {
+            // begin_assessment snapshots the buffer state BEFORE the future
+            // clones text/code, so commit() and release_pending_chunks() can
+            // bound their actions to exactly what the future scanned.
+            buffer.begin_assessment();
+            *assessment_fut = Some(create_security_assessment_future(
+                buffer,
+                security_client,
+                model_name,
+                is_prompt,
+            ));
+        }
+
+        None
+    }
+
+    /// Handles the end of a stream by performing a final assessment if needed.
+    ///
+    /// When the input stream ends, this method checks if there's any remaining content
+    /// that needs security assessment before the stream can complete.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer` - The buffer containing any remaining content
+    /// * `assessment_fut` - Optional future for pending assessments
+    /// * `security_client` - Client for performing security assessments
+    /// * `model_name` - Name of the AI model being used
+    /// * `is_prompt` - Whether this is prompt or response content
+    ///
+    /// # Returns
+    ///
+    /// Some(Result) if a final response should be sent, None if processing should continue
+    fn process_stream_end(
+        buffer: &mut StreamBuffer,
+        assessment_fut: &mut Option<AssessmentFuture>,
+        security_client: &SecurityClient,
+        model_name: &str,
+        is_prompt: bool,
+    ) -> Option<Result<Bytes, StreamError>> {
+        // Check if there's any new content since the last assessment
+        let new_text_content = buffer.text_buffer.len() > buffer.last_assessed_text_pos;
+        let new_code_content = buffer.code_buffer.len() > buffer.last_assessed_code_pos;
+
+        // Only trigger final assessment if we have new content.
+        if new_text_content || new_code_content {
+            // Snapshot the buffer state. commit() — invoked when the future
+            // resolves — uses this to advance last_assessed_* and to drain
+            // the assessed pending chunks. Do NOT pre-set last_assessed_*
+            // here; that would mark content as assessed before the future
+            // even runs (and incorrectly so if the future fails or the
+            // stream is dropped before completion).
+            buffer.begin_assessment();
+            *assessment_fut = Some(create_security_assessment_future(
+                buffer,
+                security_client,
+                model_name,
+                is_prompt,
+            ));
+        }
+        None
+    }
+
+    /// Implementation of the Stream::poll_next method.
+    ///
+    /// This method handles the stream polling logic, checking for buffered chunks,
+    /// processing pending assessments, and handling the inner stream's data.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - Pinned mutable reference to self
+    /// * `cx` - Task context for waking
+    ///
+    /// # Returns
+    ///
+    /// Poll indicating whether an item is ready or pending
+    fn poll_next_impl(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, StreamError>>>
+    where
+        S: Unpin,
+    {
+        let mut this = self.project();
+
+        // Check if content has been blocked, if so we should stop processing and close the stream
+        if this.buffer.blocked {
+            *this.finished = true;
+            return Poll::Ready(None);
+        }
+
+        // First check if we have any buffered chunks ready to return
+        if let Some(bytes) = this.buffer.get_next_chunk() {
+            return Poll::Ready(Some(Ok(bytes)));
+        }
+
+        loop {
+            if *this.finished {
+                return Poll::Ready(None);
+            }
+
+            // Idle-flush: if no assessment is in flight but we have unassessed content,
+            // poll the timer. When it elapses, force an assessment to defend against
+            // slow-dribble bypass.
+            if this.assessment_fut.is_none()
+                && this.buffer.has_unassessed_content()
+                && this.idle_timer.as_mut().poll(cx).is_ready()
+            {
+                this.buffer.begin_assessment();
+                *this.assessment_fut = Some(create_security_assessment_future(
+                    this.buffer,
+                    this.security_client,
+                    this.model_name,
+                    *this.is_prompt,
+                ));
+                this.idle_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + IDLE_FLUSH);
+            }
+
+            // Process pending security assessments
+            if let Some(fut) = this.assessment_fut.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(assessment)) => {
+                        if let Some(result) = Self::process_assessment_result(
+                            assessment,
+                            this.buffer,
+                            this.assessment_fut,
+                            this.retry_count,
+                        ) {
+                            // If content has been blocked, return the blocked message
+                            // and mark the stream as finished on the next poll
+                            if this.buffer.blocked {
+                                return Poll::Ready(Some(result));
+                            }
+                            return Poll::Ready(Some(result));
+                        }
+                        // After processing assessment, check if we have buffered chunks to return
+                        if let Some(bytes) = this.buffer.get_next_chunk() {
+                            return Poll::Ready(Some(Ok(bytes)));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.assessment_fut.take();
+                        this.buffer.blocked = true;
+                        *this.finished = true;
+                        // Drop unscanned bytes — the assessment failed, so we
+                        // must not release pending chunks downstream.
+                        this.buffer.pending_buffer.clear();
+                        this.buffer.inflight_snapshot = None;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // Process incoming stream chunks
+            match ready!(this.inner.as_mut().poll_next(cx)) {
+                Some(Ok(bytes)) => {
+                    // A chunk just arrived: extend the idle window.
+                    this.idle_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + IDLE_FLUSH);
+
+                    Self::process_stream_chunk(
+                        bytes,
+                        this.buffer,
+                        this.assessment_fut,
+                        this.security_client,
+                        this.model_name,
+                        *this.is_prompt,
+                    );
+
+                    if this.assessment_fut.is_some() {
+                        continue;
+                    } else if let Some(bytes) = this.buffer.get_next_chunk() {
+                        return Poll::Ready(Some(Ok(bytes)));
+                    }
+                    continue;
+                }
+                Some(Err(e)) => {
+                    // Mark blocked + finished so subsequent polls return None and so any
+                    // not-yet-assessed buffered bytes are dropped.
+                    this.buffer.blocked = true;
+                    *this.finished = true;
+                    this.buffer.pending_buffer.clear();
+                    this.buffer.inflight_snapshot = None;
+                    return Poll::Ready(Some(Err(StreamError::NetworkError(e.to_string()))));
+                }
+                None => {
+                    // Final assessment on stream end
+                    if let Some(result) = Self::process_stream_end(
+                        this.buffer,
+                        this.assessment_fut,
+                        this.security_client,
+                        this.model_name,
+                        *this.is_prompt,
+                    ) {
+                        return Poll::Ready(Some(result));
+                    } else if this.assessment_fut.is_some() {
+                        // Loop back to poll the assessment future (waker registered there).
+                        continue;
+                    } else if let Some(bytes) = this.buffer.get_next_chunk() {
+                        return Poll::Ready(Some(Ok(bytes)));
+                    } else {
+                        *this.finished = true;
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S> Stream for SecurityAssessedStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    type Item = Result<Bytes, StreamError>;
+
+    /// Polls this stream for the next item.
+    ///
+    /// This implementation satisfies the Stream trait by delegating to the poll_next_impl method.
+    /// It handles asynchronous polling of the wrapped stream, including security assessment of content.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - Pinned mutable reference to self
+    /// * `cx` - Task context for waking
+    ///
+    /// # Returns
+    ///
+    /// Poll indicating whether an item is ready or pending
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_next_impl(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_cap_triggers_at_threshold() {
+        let mut b = StreamBuffer::new();
+        b.text_buffer = "x".repeat(HARD_CAP_BYTES + 1);
+        assert!(b.over_cap());
+
+        let mut b2 = StreamBuffer::new();
+        b2.text_buffer = "x".repeat(HARD_CAP_BYTES / 2 + 1);
+        b2.code_buffer = "y".repeat(HARD_CAP_BYTES / 2 + 1);
+        assert!(b2.over_cap());
+
+        let mut b3 = StreamBuffer::new();
+        b3.text_buffer = "x".repeat(100);
+        assert!(!b3.over_cap());
+    }
+
+    #[test]
+    fn has_unassessed_content_reflects_positions() {
+        let mut b = StreamBuffer::new();
+        assert!(!b.has_unassessed_content());
+        b.text_buffer = "hello".to_string();
+        assert!(b.has_unassessed_content());
+        b.last_assessed_text_pos = b.text_buffer.len();
+        assert!(!b.has_unassessed_content());
+        b.code_buffer = "fn x() {}".to_string();
+        assert!(b.has_unassessed_content());
+    }
+
+    #[test]
+    fn detect_code_blocks_toggles_state_on_fence() {
+        let mut b = StreamBuffer::new();
+        b.text_buffer = "before```after".to_string();
+        b.detect_code_blocks();
+        assert!(b.in_code_block);
+    }
+
+    #[test]
+    fn process_extracts_generate_response_field() {
+        // /api/generate emits {"response":"..."} chunks (no message.content).
+        let mut b = StreamBuffer::new();
+        b.process(r#"{"response":"hello "}"#);
+        b.process(r#"{"response":"world"}"#);
+        assert_eq!(b.text_buffer, "hello world");
+    }
+
+    #[test]
+    fn process_appends_text_content() {
+        // process() parses Ollama's NDJSON wire format and routes message.content into
+        // the buffers. (Pre-existing quirk: the in_code_block toggle in process() lags
+        // by one fence boundary; detect_code_blocks() is what actually reconciles state.
+        // We assert here only the basics to lock the existing routing contract.)
+        let mut b = StreamBuffer::new();
+        b.process(r#"{"message":{"content":"hello "}}"#);
+        b.process(r#"{"message":{"content":"world"}}"#);
+        assert!(b.text_buffer.contains("hello"));
+        assert!(b.text_buffer.contains("world"));
+    }
+
+    #[test]
+    fn process_ignores_non_json_chunks() {
+        let mut b = StreamBuffer::new();
+        b.process("not-json");
+        assert!(b.text_buffer.is_empty());
+        assert!(b.code_buffer.is_empty());
+    }
+
+    // REGRESSION: stream race — commit() must only advance last_assessed_*
+    // up to the snapshot captured at begin_assessment(). Without the
+    // snapshot, bytes that arrived during the in-flight assessment would be
+    // marked assessed without ever being scanned.
+    #[test]
+    fn commit_only_advances_to_snapshot_text_len() {
+        let mut b = StreamBuffer::new();
+        b.text_buffer = "AAAAA".to_string(); // 5 bytes scanned by future
+        b.begin_assessment();                // snapshot text_len = 5
+
+        // Simulate a chunk arriving during in-flight assessment.
+        b.text_buffer.push_str("BBBBB");     // now 10 bytes, last 5 unscanned
+
+        b.commit(true);
+        assert_eq!(b.last_assessed_text_pos, 5, "must not mark post-snapshot bytes as assessed");
+        assert!(b.has_unassessed_content(), "remaining 5 bytes must still require assessment");
+    }
+
+    // REGRESSION: code_buffer must only drain the assessed prefix on commit,
+    // not the whole buffer. The original commit() called code_buffer.clear()
+    // which dropped bytes that arrived during the in-flight assessment.
+    #[test]
+    fn commit_drains_only_assessed_code_prefix() {
+        let mut b = StreamBuffer::new();
+        b.code_buffer = "OLD".to_string();
+        b.begin_assessment();        // snapshot code_len = 3
+        b.code_buffer.push_str("NEW");
+
+        b.commit(true);
+        assert_eq!(b.code_buffer, "NEW", "post-snapshot code bytes must survive commit");
+        assert_eq!(b.last_assessed_code_pos, 0);
+        assert!(b.has_unassessed_content());
+    }
+
+    // REGRESSION: release_pending_chunks must only drain the snapshot
+    // portion of pending. Chunks that arrived after the assessment started
+    // must remain in pending until the next assessment covers them.
+    #[test]
+    fn release_pending_only_drains_snapshot_portion() {
+        let mut b = StreamBuffer::new();
+        b.pending_buffer.push(Bytes::from("a"));
+        b.pending_buffer.push(Bytes::from("b"));
+        b.begin_assessment();          // snapshot pending_count = 2
+        // Simulate new chunks arriving during the in-flight assessment.
+        b.pending_buffer.push(Bytes::from("c"));
+        b.pending_buffer.push(Bytes::from("d"));
+
+        b.release_pending_chunks();
+        assert_eq!(b.pending_buffer.len(), 2, "post-snapshot pending must remain");
+        assert_eq!(b.pending_buffer[0], Bytes::from("c"));
+        assert_eq!(b.pending_buffer[1], Bytes::from("d"));
+        assert!(b.waiting_for_assessment, "still waiting since unscanned pending remains");
+    }
+
+    // REGRESSION: process_stream_end no longer pre-sets last_assessed_*.
+    // begin_assessment captures the snapshot; commit() applies it after
+    // the future actually resolves.
+    #[test]
+    fn begin_assessment_sets_snapshot() {
+        let mut b = StreamBuffer::new();
+        b.text_buffer = "hello".to_string();
+        b.code_buffer = "fn x() {}".to_string();
+        b.pending_buffer.push(Bytes::from("x"));
+
+        let snap = b.begin_assessment();
+        assert_eq!(snap.text_len, 5);
+        assert_eq!(snap.code_len, 9);
+        assert_eq!(snap.pending_count, 1);
+        assert!(b.inflight_snapshot.is_some());
+        // Must NOT have pre-advanced last_assessed_*.
+        assert_eq!(b.last_assessed_text_pos, 0);
+        assert_eq!(b.last_assessed_code_pos, 0);
+    }
+
+    // Without an in-flight snapshot, commit() falls back to current lengths
+    // (legacy behavior). Important for the empty-buffer short-circuit path.
+    #[test]
+    fn commit_without_snapshot_uses_current_lengths() {
+        let mut b = StreamBuffer::new();
+        b.text_buffer = "hi".to_string();
+        b.commit(true);
+        assert_eq!(b.last_assessed_text_pos, 2);
+        assert!(!b.has_unassessed_content());
+    }
+}
