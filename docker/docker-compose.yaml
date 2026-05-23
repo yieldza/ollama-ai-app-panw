@@ -34,6 +34,10 @@ services:
   # ── PANW security proxy ─────────────────────────────────────────────────────
   panw-api-ollama:
     image: ${PANW_API_IMAGE:-ghcr.io/paloaltonetworks/panw-api-ollama:latest}
+    # Never pull from a registry — use locally-built panw-api-ollama:local
+    # (pinned via PANW_API_IMAGE in .env). Prevents `docker compose up` from
+    # silently replacing the locally-fixed image with the upstream ghcr tag.
+    pull_policy: never
     build:
       context: ..
       dockerfile: ./Dockerfile
